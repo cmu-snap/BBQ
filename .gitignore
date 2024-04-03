@@ -1,0 +1,4 @@
+.vscode/
+.dvt
+dvt_build.log
+__pycache__/

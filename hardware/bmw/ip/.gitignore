@@ -1,0 +1,7 @@
+.qsys_edit
+*.ip
+
+my_pll
+
+# Will be generated from template.
+my_pll.tcl

@@ -1,0 +1,51 @@
+
+# Project-Wide Assignments
+# ========================
+set_global_assignment -name ORIGINAL_QUARTUS_VERSION 19.3.0
+set_global_assignment -name PROJECT_CREATION_TIME_DATE "13:24:03  JANUARY 20, 2023"
+set_global_assignment -name LAST_QUARTUS_VERSION "19.3.0 Pro Edition"
+set_global_assignment -name PROJECT_OUTPUT_DIRECTORY output_files
+
+# Pin & Location Assignments
+# ==========================
+set_location_assignment PIN_BL14 -to cpu_resetn
+set_location_assignment PIN_AT13 -to in_clk100
+set_location_assignment PIN_AU13 -to "in_clk100(n)"
+set_location_assignment PIN_BG12 -to bbq_out
+
+# Classic Timing Assignments
+# ==========================
+set_global_assignment -name MIN_CORE_JUNCTION_TEMP 0
+set_global_assignment -name MAX_CORE_JUNCTION_TEMP 100
+set_global_assignment -name TIMING_ANALYZER_MULTICORNER_ANALYSIS ON
+
+# Analysis & Synthesis Assignments
+# ================================
+set_global_assignment -name TOP_LEVEL_ENTITY top
+set_global_assignment -name FAMILY "Stratix 10"
+set_global_assignment -name SEARCH_PATH ../src/common
+
+# Fitter Assignments
+# ==================
+set_global_assignment -name DEVICE 1SM21BHU2F53E1VG
+set_instance_assignment -name IO_STANDARD LVDS -to in_clk100 -entity top
+set_instance_assignment -name IO_STANDARD LVDS -to "in_clk100(n)" -entity top
+set_instance_assignment -name IO_STANDARD "1.8 V" -to cpu_resetn -entity top
+set_instance_assignment -name IO_STANDARD "1.8 V" -to bbq_out -entity top
+
+# Ordering Sensitive Assignments
+# ==============================
+
+set_global_assignment -name OPTIMIZATION_MODE "SUPERIOR PERFORMANCE WITH MAXIMUM PLACEMENT EFFORT"
+set_global_assignment -name ENABLE_INTERMEDIATE_SNAPSHOTS ON
+set_global_assignment -name FAST_PRESERVE OFF -entity top
+
+set_global_assignment -name SYSTEMVERILOG_FILE ../src/top.sv
+set_global_assignment -name SYSTEMVERILOG_FILE ../src/bbq.sv
+set_global_assignment -name SYSTEMVERILOG_FILE ../src/ffs.sv
+set_global_assignment -name SYSTEMVERILOG_FILE ../src/heap_ops.sv
+set_global_assignment -name VERILOG_FILE ../src/common/bram_simple2port.v
+set_global_assignment -name VERILOG_FILE ../src/common/sc_fifo.v
+set_global_assignment -name IP_FILE ../ip/my_pll.ip
+
+set_global_assignment -name SDC_ENTITY_FILE bbq.sdc -entity top
