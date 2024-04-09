@@ -1,21 +1,30 @@
 #!/usr/bin/python3
+from __future__ import annotations
+
+import typing
 from abc import ABC, abstractmethod
 
 from codegen import CodeGen
 
+# Hack for type hinting with circular imports
+if typing.TYPE_CHECKING: from bbq import BBQ
+
 
 class BBQLevel(ABC):
     """Represents a generic BBQ level."""
-    def __init__(self, start_cycle: int, num_levels: int) -> None:
+    def __init__(self, bbq: BBQ, start_cycle: int) -> None:
+        self.bbq = bbq                      # Pointer to BBQ instance
         self.start_cycle = start_cycle      # Starting pipeline cycle
-        self.num_bitmap_levels = num_levels # Number of bitmap levels
 
         # Housekeeping
         self.prev_level: BBQLevel = None    # Pointer to the prev level
         self.next_level: BBQLevel = None    # Pointer to the next level
 
-        # Miscellaneous
-        self.fl_rd_delay: int = None        # Free-list read delay
+
+    @property
+    def num_bitmap_levels(self) -> int:
+        """Returns the bitmap level count."""
+        return self.bbq.num_bitmap_levels
 
 
     @property

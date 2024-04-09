@@ -1,12 +1,19 @@
 #!/usr/bin/python3
+from __future__ import annotations
+
+import typing
+
 from bbq_level import BBQLevel
 from codegen import CodeGen
+
+# Hack for type hinting with circular imports
+if typing.TYPE_CHECKING: from bbq import BBQ
 
 
 class BBQLevelPB(BBQLevel):
     """Represents the PB BBQ level."""
-    def __init__(self, start_cycle: int, num_bitmap_levels: int) -> None:
-        super().__init__(start_cycle, num_bitmap_levels)
+    def __init__(self, bbq: BBQ, start_cycle: int) -> None:
+        super().__init__(bbq, start_cycle)
 
 
     def name(self) -> str:
@@ -174,10 +181,6 @@ class BBQLevelPB(BBQLevel):
 
         cg.emit("pp_wren = 1;")
         cg.end_conditional("if")
-        cg.emit()
-
-        cg.comment("Update the heap size")
-        cg.emit("int_size = size + 1'b1;")
         cg.end_conditional("if")
         cg.emit()
 
@@ -188,12 +191,6 @@ class BBQLevelPB(BBQLevel):
 
         cg.comment("Perform deque")
         cg.start_conditional("else", None)
-        cg.start_conditional("if", "reg_valid_s[{}]".format(seq_cycle))
-        cg.comment("Update the heap size")
-        cg.emit("int_size = size - 1'b1;")
-        cg.end_conditional("if")
-        cg.emit()
-
         cg.start_conditional("if", ("reg_op_color_s[{}] == OP_COLOR_BLUE"
                                     .format(seq_cycle)))
         cg.comment("BLUE-colored dequeue (from HEAD)")
@@ -342,32 +339,25 @@ class BBQLevelPB(BBQLevel):
         # Spillover stage
         cycle = self.end_cycle + 1
         cg.comment("Stage {}: Spillover stage.".format(cycle), True)
-        cg.emit([
-            "{0}[{1}] <= {0}[{2}];".format("reg_valid_s", cycle, cycle - 1),
-            "{0}[{1}] <= {0}[{2}];".format("reg_he_data_s", cycle, cycle - 1),
-            "{0}[{1}] <= {0}[{2}];".format("reg_op_type_s", cycle, cycle - 1),
-            "{0}[{1}] <= {0}[{2}];".format("reg_is_enque_s", cycle, cycle - 1),
-            "{0}[{1}] <= {0}[{2}];".format("reg_priority_s", cycle, cycle - 1),
-            "{0}[{1}] <= {0}[{2}];".format("reg_is_deque_max_s", cycle, cycle - 1),
-            "{0}[{1}] <= {0}[{2}];".format("reg_is_deque_min_s", cycle, cycle - 1),
-        ])
-        cg.emit()
+        self.bbq.emit_sequential_primary_signals(cycle)
         cg.emit([
             "{0}{1} <= {0}{2};".format("reg_pb_data_s", cycle, cycle - 1),
         ])
-        for i in range(1, self.num_bitmap_levels):
+        for level in self.bbq.bitmap_levels:
+            if level.id < 2: continue
             cg.emit([
-                ("reg_l{0}_addr_s[{1}] <= reg_l{0}_addr_s[{2}];"
-                 .format(i + 1, cycle, cycle - 1))
+                ("reg_{0}_addr_s[{1}] <= reg_{0}_addr_s[{2}];"
+                 .format(level.name(), cycle, cycle - 1))
             ])
         cg.emit([
             "{0}[{1}] <= {0}[{2}];".format(
                 "reg_op_color_s", cycle, cycle - 1),
         ])
-        for i in range(1, self.num_bitmap_levels):
+        for level in self.bbq.bitmap_levels:
+            if level.id < 2: continue
             cg.emit([
-                ("reg_l{0}_bitmap_s[{1}] <= reg_l{0}_bitmap_s[{2}];"
-                 .format(i + 1, cycle, cycle - 1))
+                ("reg_{0}_bitmap_s[{1}] <= reg_{0}_bitmap_s[{2}];"
+                 .format(level.name(), cycle, cycle - 1))
             ])
         cg.emit()
         cycle -= 1
@@ -377,61 +367,69 @@ class BBQLevelPB(BBQLevel):
             "Stage {}: Perform writes: update the priority bucket,".format(cycle),
             "the free list, heap entries, next and prev pointers."
         ], True)
-        cg.emit([
-            "{0}[{1}] <= {0}[{2}];".format("reg_valid_s", cycle, cycle - 1),
-            "{0}[{1}] <= he_data_s{1};".format("reg_he_data_s", cycle),
-            "{0}[{1}] <= {0}[{2}];".format("reg_op_type_s", cycle, cycle - 1),
-            "{0}[{1}] <= {0}[{2}];".format("reg_is_enque_s", cycle, cycle - 1),
-            "{0}[{1}] <= {0}[{2}];".format("reg_priority_s", cycle, cycle - 1),
-            "{0}[{1}] <= {0}[{2}];".format("reg_is_deque_max_s", cycle, cycle - 1),
-            "{0}[{1}] <= {0}[{2}];".format("reg_is_deque_min_s", cycle, cycle - 1),
-        ])
-        cg.emit()
+
+        value_override = {"reg_he_data_s" : "he_data_s{}".format(cycle)}
+        self.bbq.emit_sequential_primary_signals(cycle, value_override)
+
         cg.emit([
             "reg_he_data_s{} <= he_data;".format(cycle),
             "reg_np_data_s{} <= np_data;".format(cycle),
             "reg_pp_data_s{} <= pp_data;".format(cycle),
             "reg_pb_data_s{} <= int_pb_data;".format(cycle),
         ])
-        for i in range(1, self.num_bitmap_levels):
+        for level in self.bbq.bitmap_levels:
+            if level.id < 2: continue
             cg.emit([
-                ("reg_l{0}_addr_s[{1}] <= reg_l{0}_addr_s[{2}];"
-                 .format(i + 1, cycle, cycle - 1))
+                ("reg_{0}_addr_s[{1}] <= reg_{0}_addr_s[{2}];"
+                 .format(level.name(), cycle, cycle - 1))
             ])
         cg.emit([
             "{0}[{1}] <= {0}[{2}];".format(
                 "reg_op_color_s", cycle, cycle - 1),
         ])
-        for i in range(1, self.num_bitmap_levels):
+        for level in self.bbq.bitmap_levels:
+            if level.id < 2: continue
             cg.emit([
-                ("reg_l{0}_bitmap_s[{1}] <= reg_l{0}_bitmap_s[{2}];"
-                 .format(i + 1, cycle, cycle - 1))
+                ("reg_{0}_bitmap_s[{1}] <= reg_{0}_bitmap_s[{2}];"
+                 .format(level.name(), cycle, cycle - 1))
             ])
 
         cg.emit()
-        cg.comment("Update the heap size")
-        cg.emit(["size <= int_size;"])
-        cg.emit()
-
         cg.start_ifdef("DEBUG")
+        id_str_prefix = ("logical ID: %0d, "
+                         if self.bbq.is_logically_partitioned else "")
+
+        id_val_prefix = ("reg_bbq_id_s[{}], ".format(cycle - 1)
+                         if self.bbq.is_logically_partitioned else "")
+
+        priority_str_prefix = ("relative "
+                               if self.bbq.is_logically_partitioned else "")
+
+        priority_val_suffix = (" & (HEAP_NUM_PRIORITIES_PER_LP - 1)"
+                               if self.bbq.is_logically_partitioned else "")
+
         cg.start_conditional("if", "reg_valid_s[{}]".format(cycle - 1))
         cg.start_conditional("if", "!reg_pb_state_changes_s{}".format(cycle - 1))
         cg.emit("$display(")
         cg.emit([
-            "\"[BBQ] At S{} (op: %s, color: %s) updating priority = %0d,\",".format(cycle),
-            "reg_op_type_s[{0}].name, reg_op_color_s[{0}].name,".format(cycle - 1),
-            "reg_priority_s[{}], \" pb (head, tail) changes from \",".format(cycle - 1),
+            "\"[BBQ] At S{} ({}op: %s, color: %s),\",".format(cycle, id_str_prefix),
+            "{0}reg_op_type_s[{1}].name, reg_op_color_s[{1}].name,".format(id_val_prefix, cycle - 1),
+            "\" updating ({}priority = %0d),\",".format(priority_str_prefix),
+            "reg_priority_s[{}]{},".format(cycle - 1, priority_val_suffix),
+            "\" pb (head, tail) changes from \",".format(cycle - 1),
             "\"(%b, %b) to (%b, %b)\", reg_pb_q_s{}.head,".format(cycle - 1),
-            "reg_pb_q_s{0}.tail, int_pb_data.head, int_pb_data.tail);".format(cycle - 1),
+            "reg_pb_q_s{}.tail, int_pb_data.head, int_pb_data.tail);".format(cycle - 1),
         ], True, 4)
         cg.end_conditional("if")
 
         cg.start_conditional("else if", "reg_is_enque_s[{}]".format(cycle - 1))
         cg.emit("$display(")
         cg.emit([
-            "\"[BBQ] At S{} (op: %s, color: %s) updating priority = %0d,\",".format(cycle),
-            "reg_op_type_s[{0}].name, reg_op_color_s[{0}].name,".format(cycle - 1),
-            "reg_priority_s[{}], \" pb (head, tail) changes from \",".format(cycle - 1),
+            "\"[BBQ] At S{} ({}op: %s, color: %s),\",".format(cycle, id_str_prefix),
+            "{0}reg_op_type_s[{1}].name, reg_op_color_s[{1}].name,".format(id_val_prefix, cycle - 1),
+            "\" updating ({}priority = %0d),\",".format(priority_str_prefix),
+            "reg_priority_s[{}]{},".format(cycle - 1, priority_val_suffix),
+            "\" pb (head, tail) changes from \",".format(cycle - 1),
             "\"(INVALID_PTR, INVALID_PTR) to (%b, %b)\",",
             "int_pb_data.head, int_pb_data.tail);",
         ], True, 4)
@@ -440,9 +438,11 @@ class BBQLevelPB(BBQLevel):
         cg.start_conditional("else", None)
         cg.emit("$display(")
         cg.emit([
-            "\"[BBQ] At S{} (op: %s, color: %s) updating priority = %0d,\",".format(cycle),
-            "reg_op_type_s[{0}].name, reg_op_color_s[{0}].name,".format(cycle - 1),
-            "reg_priority_s[{}], \" pb (head, tail) changes from \",".format(cycle - 1),
+            "\"[BBQ] At S{} ({}op: %s, color: %s),\",".format(cycle, id_str_prefix),
+            "{0}reg_op_type_s[{1}].name, reg_op_color_s[{1}].name,".format(id_val_prefix, cycle - 1),
+            "\" updating ({}priority = %0d),\",".format(priority_str_prefix),
+            "reg_priority_s[{}]{},".format(cycle - 1, priority_val_suffix),
+            "\" pb (head, tail) changes from \",".format(cycle - 1),
             "\"(%b, %b) to (INVALID_PTR, INVALID_PTR)\",",
             "reg_pb_q_s{0}.head, reg_pb_q_s{0}.tail);".format(cycle - 1),
         ], True, 4)
@@ -454,29 +454,22 @@ class BBQLevelPB(BBQLevel):
 
         # Read delay for data, pointers
         cg.comment("Stage {}: Read delay for HE and pointers.".format(cycle), True)
-        cg.emit([
-            "{0}[{1}] <= {0}[{2}];".format("reg_valid_s", cycle, cycle - 1),
-            "{0}[{1}] <= {0}[{2}];".format("reg_he_data_s", cycle, cycle - 1),
-            "{0}[{1}] <= {0}[{2}];".format("reg_op_type_s", cycle, cycle - 1),
-            "{0}[{1}] <= {0}[{2}];".format("reg_is_enque_s", cycle, cycle - 1),
-            "{0}[{1}] <= {0}[{2}];".format("reg_priority_s", cycle, cycle - 1),
-            "{0}[{1}] <= {0}[{2}];".format("reg_is_deque_max_s", cycle, cycle - 1),
-            "{0}[{1}] <= {0}[{2}];".format("reg_is_deque_min_s", cycle, cycle - 1),
-        ])
-        cg.emit()
-        for i in range(1, self.num_bitmap_levels):
+        self.bbq.emit_sequential_primary_signals(cycle)
+        for level in self.bbq.bitmap_levels:
+            if level.id < 2: continue
             cg.emit([
-                ("reg_l{0}_addr_s[{1}] <= reg_l{0}_addr_s[{2}];"
-                 .format(i + 1, cycle, cycle - 1))
+                ("reg_{0}_addr_s[{1}] <= reg_{0}_addr_s[{2}];"
+                 .format(level.name(), cycle, cycle - 1))
             ])
         cg.emit([
             "{0}[{1}] <= {0}[{2}];".format(
                 "reg_op_color_s", cycle, cycle - 1),
         ])
-        for i in range(1, self.num_bitmap_levels):
+        for level in self.bbq.bitmap_levels:
+            if level.id < 2: continue
             cg.emit([
-                ("reg_l{0}_bitmap_s[{1}] <= reg_l{0}_bitmap_s[{2}];"
-                 .format(i + 1, cycle, cycle - 1))
+                ("reg_{0}_bitmap_s[{1}] <= reg_{0}_bitmap_s[{2}];"
+                 .format(level.name(), cycle, cycle - 1))
             ])
         cg.emit([
             "{0}{1} <= {0}{2};".format("reg_pb_data_conflict_s", cycle, cycle - 1),
@@ -508,11 +501,11 @@ class BBQLevelPB(BBQLevel):
         cg.comment("PB becomes non-empty, update tail")
         cg.start_conditional("if", "reg_pb_state_changes_s{}".format(cycle - 1))
         cg.emit("reg_pb_new_s{}.tail <= fl_q_r[{}];"
-                .format(cycle, self.fl_rd_delay - 2))
+                .format(cycle, self.bbq.fl_rd_delay - 2))
 
         cg.end_conditional("if")
         cg.emit("reg_pb_new_s{}.head <= fl_q_r[{}];"
-                .format(cycle, self.fl_rd_delay - 2))
+                .format(cycle, self.bbq.fl_rd_delay - 2))
 
         cg.end_conditional("if")
         cg.emit()
@@ -532,11 +525,25 @@ class BBQLevelPB(BBQLevel):
         cg.end_ifdef()
 
         cg.start_ifdef("DEBUG")
+        id_str_prefix = ("logical ID: %0d, "
+                         if self.bbq.is_logically_partitioned else "")
+
+        id_val_prefix = ("reg_bbq_id_s[{}], ".format(cycle - 1)
+                         if self.bbq.is_logically_partitioned else "")
+
+        priority_str_prefix = ("relative "
+                               if self.bbq.is_logically_partitioned else "")
+
+        priority_val_suffix = (" & (HEAP_NUM_PRIORITIES_PER_LP - 1)"
+                               if self.bbq.is_logically_partitioned else "")
+
         cg.start_conditional("if", "reg_valid_s[{}]".format(cycle - 1))
         cg.emit("$display(")
         cg.emit([
-            "\"[BBQ] At S{} (op: %s) for PB (priority = %0d)\",".format(cycle),
-            "reg_op_type_s[{0}].name, reg_priority_s[{0}]);".format(cycle - 1),
+            "\"[BBQ] At S{} ({}op: %s)\",".format(cycle, id_str_prefix),
+            "{}reg_op_type_s[{}].name,".format(id_val_prefix, cycle - 1),
+            "\" for PB ({}priority = %0d)\",".format(priority_str_prefix),
+            "reg_priority_s[{}]{});".format(cycle - 1, priority_val_suffix),
         ], True, 4)
         cg.end_conditional("if")
         cg.end_ifdef()
@@ -548,30 +555,24 @@ class BBQLevelPB(BBQLevel):
             "Stage {}: Read the heap entry and prev/next pointer".format(cycle),
             "corresponding to the priority bucket to deque."
         ], True)
-        cg.emit([
-            "{0}[{1}] <= {0}[{2}];".format("reg_valid_s", cycle, cycle - 1),
-            "{0}[{1}] <= {0}[{2}];".format("reg_he_data_s", cycle, cycle - 1),
-            "{0}[{1}] <= {0}[{2}];".format("reg_op_type_s", cycle, cycle - 1),
-            "{0}[{1}] <= {0}[{2}];".format("reg_is_enque_s", cycle, cycle - 1),
-            "{0}[{1}] <= {0}[{2}];".format("reg_priority_s", cycle, cycle - 1),
-            "{0}[{1}] <= {0}[{2}];".format("reg_is_deque_max_s", cycle, cycle - 1),
-            "{0}[{1}] <= {0}[{2}];".format("reg_is_deque_min_s", cycle, cycle - 1),
-        ])
-        cg.emit()
+        self.bbq.emit_sequential_primary_signals(cycle)
+
         cg.emit("reg_pb_q_s{} <= int_pb_q;".format(cycle))
-        for i in range(1, self.num_bitmap_levels):
+        for level in self.bbq.bitmap_levels:
+            if level.id < 2: continue
             cg.emit([
-                ("reg_l{0}_addr_s[{1}] <= reg_l{0}_addr_s[{2}];"
-                 .format(i + 1, cycle, cycle - 1))
+                ("reg_{0}_addr_s[{1}] <= reg_{0}_addr_s[{2}];"
+                 .format(level.name(), cycle, cycle - 1))
             ])
         cg.emit([
             "{0}[{1}] <= {0}[{2}];".format(
                 "reg_op_color_s", cycle, cycle - 1),
         ])
-        for i in range(1, self.num_bitmap_levels):
+        for level in self.bbq.bitmap_levels:
+            if level.id < 2: continue
             cg.emit([
-                ("reg_l{0}_bitmap_s[{1}] <= reg_l{0}_bitmap_s[{2}];"
-                 .format(i + 1, cycle, cycle - 1))
+                ("reg_{0}_bitmap_s[{1}] <= reg_{0}_bitmap_s[{2}];"
+                 .format(level.name(), cycle, cycle - 1))
             ])
         cg.emit([
             "{0}{1} <= {0}{2};".format("reg_pb_data_conflict_s", cycle, cycle - 1),
@@ -588,7 +589,7 @@ class BBQLevelPB(BBQLevel):
 
         cg.emit([
             ("reg_pp_data_s{0} <= pp_changes_s{1}_s{0} ? fl_q_r[{2}] : fl_q_r[{3}];"
-             .format(cycle, cycle + 1, self.fl_rd_delay - 3, self.fl_rd_delay - 2)),
+             .format(cycle, cycle + 1, self.bbq.fl_rd_delay - 3, self.bbq.fl_rd_delay - 2)),
 
             ("reg_pp_data_valid_s{0} <= (pp_changes_s{1}_s{0} || pp_changes_s{2}_s{0});"
              .format(cycle, cycle + 1, cycle + 2)),
@@ -596,11 +597,25 @@ class BBQLevelPB(BBQLevel):
         cg.emit()
 
         cg.start_ifdef("DEBUG")
+        id_str_prefix = ("logical ID: %0d, "
+                         if self.bbq.is_logically_partitioned else "")
+
+        id_val_prefix = ("reg_bbq_id_s[{}], ".format(cycle - 1)
+                         if self.bbq.is_logically_partitioned else "")
+
+        priority_str_prefix = ("relative "
+                               if self.bbq.is_logically_partitioned else "")
+
+        priority_val_suffix = (" & (HEAP_NUM_PRIORITIES_PER_LP - 1)"
+                               if self.bbq.is_logically_partitioned else "")
+
         cg.start_conditional("if", "reg_valid_s[{}]".format(cycle - 1))
         cg.emit("$display(")
         cg.emit([
-            "\"[BBQ] At S{} (op: %s) for PB (priority = %0d)\",".format(cycle),
-            "reg_op_type_s[{0}].name, reg_priority_s[{0}]);".format(cycle - 1),
+            "\"[BBQ] At S{} ({}op: %s)\",".format(cycle, id_str_prefix),
+            "{}reg_op_type_s[{}].name,".format(id_val_prefix, cycle - 1),
+            "\" for PB ({}priority = %0d)\",".format(priority_str_prefix),
+            "reg_priority_s[{}]{});".format(cycle - 1, priority_val_suffix),
         ], True, 4)
         cg.end_conditional("if")
         cg.end_ifdef()
@@ -610,26 +625,21 @@ class BBQLevelPB(BBQLevel):
         # Read delay for PB
         cg.comment(("Stage {}: Compute op color, read delay for PB."
                     .format(cycle)), True)
-        cg.emit([
-            "{0}[{1}] <= {0}[{2}];".format("reg_valid_s", cycle, cycle - 1),
-            "{0}[{1}] <= {0}[{2}];".format("reg_he_data_s", cycle, cycle - 1),
-            "{0}[{1}] <= {0}[{2}];".format("reg_op_type_s", cycle, cycle - 1),
-            "{0}[{1}] <= {0}[{2}];".format("reg_is_enque_s", cycle, cycle - 1),
-            "{0}[{1}] <= {0}[{2}];".format("reg_priority_s", cycle, cycle - 1),
-            "{0}[{1}] <= {0}[{2}];".format("reg_is_deque_max_s", cycle, cycle - 1),
-            "{0}[{1}] <= {0}[{2}];".format("reg_is_deque_min_s", cycle, cycle - 1),
-        ])
-        cg.emit()
+
+        self.bbq.emit_sequential_primary_signals(cycle)
+
         cg.emit("reg_{0}[{1}] <= {0}{1};".format("op_color_s", cycle))
-        for i in range(1, self.num_bitmap_levels):
+        for level in self.bbq.bitmap_levels:
+            if level.id < 2: continue
             cg.emit([
-                ("reg_l{0}_addr_s[{1}] <= reg_l{0}_addr_s[{2}];"
-                 .format(i + 1, cycle, cycle - 1))
+                ("reg_{0}_addr_s[{1}] <= reg_{0}_addr_s[{2}];"
+                 .format(level.name(), cycle, cycle - 1))
             ])
-        for i in range(1, self.num_bitmap_levels):
+        for level in self.bbq.bitmap_levels:
+            if level.id < 2: continue
             cg.emit([
-                ("reg_l{0}_bitmap_s[{1}] <= reg_l{0}_bitmap_s[{2}];"
-                 .format(i + 1, cycle, cycle - 1))
+                ("reg_{0}_bitmap_s[{1}] <= reg_{0}_bitmap_s[{2}];"
+                 .format(level.name(), cycle, cycle - 1))
             ])
         cg.emit("reg_pb_update_s{} <= reg_pb_addr_conflict_s{}_s{};"
                 .format(cycle, cycle + 2, cycle - 1))
@@ -648,8 +658,8 @@ class BBQLevelPB(BBQLevel):
         ])
         cg.align_assignment("reg_pb_data_conflict_s{}".format(cycle), [
             "(reg_is_enque_s[{}] &&".format(cycle),
-            ("!reg_l{0}_counter_non_zero_s{1} && reg_pb_addr_conflict_s{2}_s{1});"
-             .format(self.prev_level.level_id, cycle - 1, cycle))
+            ("!reg_{0}_counter_non_zero_s{1} && reg_pb_addr_conflict_s{2}_s{1});"
+             .format(self.prev_level.name(), cycle - 1, cycle))
         ],
         "<=", True)
         cg.emit()
@@ -661,13 +671,12 @@ class BBQLevelPB(BBQLevel):
             "and for deques, corresponds to a PB becoming empty.",
         ])
         cg.align_assignment("reg_pb_state_changes_s{}".format(cycle), [
-            "(",
-            "reg_is_enque_s[{}] ?".format(cycle - 1),
-            ("(!reg_l{0}_counter_s{1}[WATERLEVEL_IDX] && reg_l{0}_counter_s{1}[0]) :"
-             .format(self.prev_level.level_id, cycle - 1)),
+            "(reg_is_enque_s[{}] ?".format(cycle - 1),
+            ("(!reg_{0}_counter_s{1}[WATERLEVEL_IDX] && reg_{0}_counter_s{1}[0]) :"
+             .format(self.prev_level.name(), cycle - 1)),
 
-            ("(!reg_l{0}_counter_s{1}[WATERLEVEL_IDX] && !reg_l{0}_counter_s{1}[0]));"
-             .format(self.prev_level.level_id, cycle - 1)),
+            ("(!reg_{0}_counter_s{1}[WATERLEVEL_IDX] && !reg_{0}_counter_s{1}[0]));"
+             .format(self.prev_level.name(), cycle - 1)),
         ],
         "<=", True)
         cg.emit()
@@ -679,18 +688,35 @@ class BBQLevelPB(BBQLevel):
         ])
         cg.align_assignment("reg_pb_tail_pp_changes_s{}".format(cycle), [
             "(reg_is_enque_s[{}] &&".format(cycle - 1),
-            ("!reg_old_l{0}_counter_s{1}[WATERLEVEL_IDX] && reg_old_l{0}_counter_s{1}[0]);"
-             .format(self.prev_level.level_id, cycle - 1)),
+            ("!reg_old_{}_counter_s{}[WATERLEVEL_IDX]"
+             .format(self.prev_level.name(), cycle - 1)),
+
+            ("&& reg_old_{}_counter_s{}[0]);"
+             .format(self.prev_level.name(), cycle - 1))
         ],
         "<=", True)
         cg.emit()
 
         cg.start_ifdef("DEBUG")
+        id_str_prefix = ("logical ID: %0d, "
+                         if self.bbq.is_logically_partitioned else "")
+
+        id_val_prefix = ("reg_bbq_id_s[{}], ".format(cycle - 1)
+                         if self.bbq.is_logically_partitioned else "")
+
+        priority_str_prefix = ("relative "
+                               if self.bbq.is_logically_partitioned else "")
+
+        priority_val_suffix = (" & (HEAP_NUM_PRIORITIES_PER_LP - 1)"
+                               if self.bbq.is_logically_partitioned else "")
+
         cg.start_conditional("if", "reg_valid_s[{}]".format(cycle - 1))
         cg.emit("$display(")
         cg.emit([
-            "\"[BBQ] At S{} (op: %s) for PB (priority = %0d)\",".format(cycle),
-            "reg_op_type_s[{0}].name, reg_priority_s[{0}],".format(cycle - 1),
+            "\"[BBQ] At S{} ({}op: %s)\",".format(cycle, id_str_prefix),
+            "{}reg_op_type_s[{}].name,".format(id_val_prefix, cycle - 1),
+            ("\" for PB ({}priority = %0d)\",".format(priority_str_prefix)),
+            "reg_priority_s[{}]{},".format(cycle - 1, priority_val_suffix),
             "\" assigned color %s\", op_color_s{}.name);".format(cycle)
         ], True, 4)
         cg.end_conditional("if")

@@ -89,7 +89,6 @@ logic                                    heap_out_valid;
 heap_op_t                                heap_out_op_type;
 logic [HEAP_ENTRY_DWIDTH-1:0]            heap_out_he_data;
 logic [HEAP_PRIORITY_BUCKETS_AWIDTH-1:0] heap_out_he_priority;
-logic [HEAP_ENTRY_AWIDTH-1:0]            heap_size;
 
 logic [31:0] out_placeholder;
 logic bbq_out_r;
@@ -100,7 +99,6 @@ always_comb begin
     out_placeholder ^= heap_out_op_type;
     out_placeholder ^= heap_out_he_data;
     out_placeholder ^= heap_out_he_priority;
-    out_placeholder ^= heap_size;
 
     bbq_out_r = ^out_placeholder ^ heap_out_valid;
 end
@@ -126,8 +124,7 @@ bbq_inst (
     .out_valid(heap_out_valid),
     .out_op_type(heap_out_op_type),
     .out_he_data(heap_out_he_data),
-    .out_he_priority(heap_out_he_priority),
-    .size(heap_size)
+    .out_he_priority(heap_out_he_priority)
 );
 
 endmodule

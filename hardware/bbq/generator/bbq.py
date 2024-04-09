@@ -1,9 +1,10 @@
 #!/usr/bin/python3
 import argparse
-import sys
+import math
 from typing import List
 
 from bbq_level import BBQLevel
+from bbq_level_ingress import BBQLevelIngress
 from bbq_level_lx import BBQLevelLX
 from bbq_level_pb import BBQLevelPB
 from bbq_level_steering import BBQLevelSteering
@@ -13,30 +14,43 @@ from toolz.itertoolz import partition
 
 class BBQ:
     """Class for generating configurable BBQs."""
-    def __init__(self, num_bitmap_levels: int) -> None:
-        self.codegen = CodeGen() # Code generation backend
+    def __init__(self, num_bitmap_levels: int, num_lps: int=1,
+                 bitmap_width: int=0) -> None:
 
-        # BBQ parameters
+        # BBQ configuration
+        self.num_lps = num_lps
+        self.bitmap_width = bitmap_width
         self.num_bitmap_levels = num_bitmap_levels
-        assert num_bitmap_levels >= 1 # Sanity check
+        self.validate_configuration() # Perform validation
 
+        # Generate ingress level
         start_cycle = 1
         self.levels : List[BBQLevel] = [
-            BBQLevelSteering(start_cycle, num_bitmap_levels)
+            BBQLevelIngress(self, start_cycle)
         ]
         start_cycle = self.levels[-1].end_cycle + 1
 
+        # Generate steering level
+        start_level_id = 1
+        if self.is_logically_partitioned:
+            start_level_id = int(math.log(num_lps, bitmap_width))
+            level = BBQLevelSteering(self, start_cycle,
+                                     num_lps, start_level_id)
+
+            self.levels.append(level)
+            start_cycle = level.end_cycle + 1
+            start_level_id += 1 # Skip corresponding LX levels
+
         # Populate the list with all LX levels
-        for i in range(self.num_bitmap_levels):
-            level_id = i + 1
-            level = BBQLevelLX(start_cycle, num_bitmap_levels, level_id,
+        for level_id in range(start_level_id, self.num_bitmap_levels + 1):
+            level = BBQLevelLX(self, start_cycle, level_id,
                                (level_id >= 3), (level_id >= 2))
 
             self.levels.append(level)
             start_cycle = level.end_cycle + 1
 
         # Finally, append the PB level into the list
-        self.levels.append(BBQLevelPB(start_cycle, num_bitmap_levels))
+        self.levels.append(BBQLevelPB(self, start_cycle))
         self.num_pipeline_stages = self.levels[-1].end_cycle + 1
 
         # Update next and prev pointers
@@ -50,14 +64,41 @@ class BBQ:
         self.fl_rd_delay = (self.levels[-1].end_cycle -
                             self.levels[0].end_cycle - 1)
 
-        for level in self.levels:
-            level.fl_rd_delay = self.fl_rd_delay
+        # Finally, instantiate backend
+        self.codegen = CodeGen()
 
 
     @property
     def bitmap_levels(self) -> List[BBQLevelLX]:
         """Returns levels of the bitmap tree."""
-        return self.levels[1:-1]
+        bitmap_levels = []
+        for level in self.levels:
+            if isinstance(level, BBQLevelLX):
+                bitmap_levels.append(level)
+
+        return bitmap_levels
+
+
+    @property
+    def is_logically_partitioned(self) -> bool:
+        """Uses logical paritioning?"""
+        return self.num_lps > 1
+
+
+    def validate_configuration(self) -> None:
+        """Validate the BBQ configuration."""
+        if self.num_bitmap_levels < 1:
+            raise ValueError("Number of bitmap levels must be GEQ 1.")
+
+        if self.is_logically_partitioned:
+            if not self.bitmap_width:
+                raise ValueError("Bitmap width must be specified if "
+                                 "logical partitioning is enabled.")
+
+            # TODO(natre): Remove after implementing intra-level partitioning
+            if not math.log(self.num_lps, self.bitmap_width).is_integer():
+                raise ValueError("Number of logical partitions must be a "
+                                 "power of the bitmap width.")
 
 
     def emit_prologue(self) -> None:
@@ -76,17 +117,39 @@ class BBQ:
         self.codegen.emit("module bbq #(")
         self.codegen.inc_level()
         self.codegen.emit([
-            "parameter HEAP_BITMAP_WIDTH = 4,",
+            (None if self.is_logically_partitioned
+             else "parameter HEAP_BITMAP_WIDTH = 4,"),
+
             "parameter HEAP_ENTRY_DWIDTH = 17,",
             "parameter HEAP_MAX_NUM_ENTRIES = ((1 << 17) - 1),",
-            "localparam HEAP_ENTRY_AWIDTH = ($clog2(HEAP_MAX_NUM_ENTRIES)),",
+        ])
+        if self.is_logically_partitioned:
+            self.codegen.emit([
+                ("localparam HEAP_BITMAP_WIDTH = {}, {}".format(
+                    self.bitmap_width, "// Bitmap bit-width")),
 
+                ("localparam HEAP_NUM_LPS = {}, {}".format(
+                    self.num_lps, "// Number of logical BBQs")),
+
+                "localparam HEAP_LOGICAL_BBQ_AWIDTH = ($clog2(HEAP_NUM_LPS)),",
+            ])
+        self.codegen.emit([
+            "localparam HEAP_ENTRY_AWIDTH = ($clog2(HEAP_MAX_NUM_ENTRIES)),",
             ("localparam HEAP_NUM_LEVELS = {}, {}".format(
-                self.num_bitmap_levels, "// AUTOGENERATED, DO NOT MODIFY HERE")),
+                self.num_bitmap_levels, "// Number of bitmap tree levels")),
 
             "localparam HEAP_NUM_PRIORITIES = (HEAP_BITMAP_WIDTH ** HEAP_NUM_LEVELS),",
-            "localparam HEAP_PRIORITY_BUCKETS_AWIDTH = ($clog2(HEAP_NUM_PRIORITIES))",
         ])
+        self.codegen.emit([
+            "localparam HEAP_PRIORITY_BUCKETS_AWIDTH = ($clog2(HEAP_NUM_PRIORITIES)){}"
+            .format("," if self.is_logically_partitioned else ""),
+        ])
+        if self.is_logically_partitioned:
+            self.codegen.emit([
+                "localparam HEAP_NUM_PRIORITIES_PER_LP = (HEAP_NUM_PRIORITIES / HEAP_NUM_LPS),",
+                "localparam HEAP_PRIORITY_BUCKETS_LP_AWIDTH = ($clog2(HEAP_NUM_PRIORITIES_PER_LP))",
+            ])
+
         self.codegen.dec_level()
         self.codegen.emit(") (")
         self.codegen.inc_level()
@@ -113,13 +176,8 @@ class BBQ:
             "output  logic                                       out_valid,",
             "output  heap_op_t                                   out_op_type,",
             "output  logic [HEAP_ENTRY_DWIDTH-1:0]               out_he_data,",
-            "output  logic [HEAP_PRIORITY_BUCKETS_AWIDTH-1:0]    out_he_priority,",
+            "output  logic [HEAP_PRIORITY_BUCKETS_AWIDTH-1:0]    out_he_priority",
         ])
-        self.codegen.emit()
-
-        self.codegen.comment("Feedback signals")
-        self.codegen.emit(
-            "output  logic [HEAP_ENTRY_AWIDTH-1:0]               size")
 
         self.codegen.dec_level()
         self.codegen.emit(");")
@@ -212,6 +270,12 @@ class BBQ:
         self.codegen.emit([
             "typedef logic [COUNTER_T_WIDTH-1:0] counter_t;",
             "typedef logic [HEAP_BITMAP_WIDTH-1:0] bitmap_t;",
+        ])
+        if self.is_logically_partitioned:
+            self.codegen.emit([
+                "typedef logic [HEAP_LOGICAL_BBQ_AWIDTH-1:0] bbq_id_t;"
+            ])
+        self.codegen.emit([
             "typedef logic [HEAP_ENTRY_AWIDTH-1:0] heap_entry_ptr_t;",
             "typedef logic [HEAP_ENTRY_DWIDTH-1:0] heap_entry_data_t;",
             "typedef logic [HEAP_PRIORITY_BUCKETS_AWIDTH-1:0] heap_priority_t;",
@@ -241,21 +305,19 @@ class BBQ:
         for level in self.bitmap_levels:
             if not level.sram_bitmap:
                 var = ("l1_bitmap; // L1 bitmap" if (level.id == 1)
-                       else ("l{0}_bitmaps[NUM_BITMAPS_L{0}-1:0"
-                             "]; // L{0} bitmaps".format(level.id)))
+                       else ("{0}_bitmaps[NUM_BITMAPS_L{1}-1:0"
+                             "]; // L{1} bitmaps".format(level.name(), level.id)))
 
                 self.codegen.emit("bitmap_t " + var)
 
         # Emit register-based counters
         for level in self.bitmap_levels:
             if not level.sram_counters:
-                var = ("l{0}_counters[NUM_COUNTERS_L{0}-1:0"
-                       "]; // L{0} counters".format(level.id))
+                var = ("{0}_counters[NUM_COUNTERS_L{1}-1:0"
+                       "]; // L{1} counters".format(level.name(), level.id))
 
                 self.codegen.emit("counter_t " + var)
 
-        self.codegen.emit("counter_t bbq_occupancy; "
-                          "// BBQ occupancy (including pipeline ops)")
         self.codegen.emit()
 
         # Emit free list signals
@@ -340,35 +402,47 @@ class BBQ:
             if level.sram_bitmap:
                 self.codegen.comment("L{} bitmaps".format(level.id))
                 self.codegen.emit([
-                    "logic bm_l{}_rden;".format(level.id),
-                    "logic bm_l{}_wren;".format(level.id),
-                    "logic [HEAP_BITMAP_WIDTH-1:0] bm_l{}_q;".format(level.id),
-                    "logic [HEAP_BITMAP_WIDTH-1:0] bm_l{}_data;".format(level.id),
-                    "logic [HEAP_BITMAP_WIDTH-1:0] bm_l{}_data_r;".format(level.id),
-                    "logic [BITMAP_L{0}_AWIDTH-1:0] bm_l{0}_rdaddress;".format(level.id),
-                    "logic [BITMAP_L{0}_AWIDTH-1:0] bm_l{0}_wraddress;".format(level.id),
-                    "logic [BITMAP_L{0}_AWIDTH-1:0] bm_l{0}_wraddress_counter_r;".format(level.id),
+                    "logic bm_{}_rden;".format(level.name()),
+                    "logic bm_{}_wren;".format(level.name()),
+                    "logic [HEAP_BITMAP_WIDTH-1:0] bm_{}_q;".format(level.name()),
+                    "logic [HEAP_BITMAP_WIDTH-1:0] bm_{}_data;".format(level.name()),
+                    "logic [HEAP_BITMAP_WIDTH-1:0] bm_{}_data_r;".format(level.name()),
+                    "logic [BITMAP_L{}_AWIDTH-1:0] bm_{}_rdaddress;".format(level.id, level.name()),
+                    "logic [BITMAP_L{}_AWIDTH-1:0] bm_{}_wraddress;".format(level.id, level.name()),
+                    "logic [BITMAP_L{}_AWIDTH-1:0] bm_{}_wraddress_counter_r;".format(level.id, level.name()),
                 ])
                 self.codegen.emit()
 
             if level.sram_counters:
                 self.codegen.comment("L{} counters".format(level.id))
                 self.codegen.emit([
-                    "logic counter_l{}_rden;".format(level.id),
-                    "logic counter_l{}_wren;".format(level.id),
-                    "logic [COUNTER_T_WIDTH-1:0] counter_l{}_q;".format(level.id),
-                    "logic [COUNTER_T_WIDTH-1:0] counter_l{}_data;".format(level.id),
-                    "logic [COUNTER_L{0}_AWIDTH-1:0] counter_l{0}_rdaddress;".format(level.id),
-                    "logic [COUNTER_L{0}_AWIDTH-1:0] counter_l{0}_wraddress;".format(level.id),
-                    "logic [COUNTER_L{0}_AWIDTH-1:0] counter_l{0}_wraddress_counter_r;".format(level.id),
+                    "logic counter_{}_rden;".format(level.name()),
+                    "logic counter_{}_wren;".format(level.name()),
+                    "logic [COUNTER_T_WIDTH-1:0] counter_{}_q;".format(level.name()),
+                    "logic [COUNTER_T_WIDTH-1:0] counter_{}_data;".format(level.name()),
+                    "logic [COUNTER_L{}_AWIDTH-1:0] counter_{}_rdaddress;".format(level.id, level.name()),
+                    "logic [COUNTER_L{}_AWIDTH-1:0] counter_{}_wraddress;".format(level.id, level.name()),
+                    "logic [COUNTER_L{}_AWIDTH-1:0] counter_{}_wraddress_counter_r;".format(level.id, level.name()),
                 ])
                 self.codegen.emit()
+
+        if self.is_logically_partitioned:
+            self.codegen.comment("Heap occupancy per logical BBQ")
+            self.codegen.emit("counter_t occupancy[HEAP_NUM_LPS-1:0];")
+        else:
+            self.codegen.comment("Heap occupancy")
+            self.codegen.emit("counter_t occupancy;")
+
+        self.codegen.emit()
 
         # Emit common pipeline stage data
         self.codegen.comment("Housekeeping.", True)
         self.codegen.comment("Common pipeline metadata")
         self.codegen.align_defs([
             ("logic", "reg_valid_s[NUM_PIPELINE_STAGES:0];"),
+            ("bbq_id_t", ("reg_bbq_id_s[NUM_PIPELINE_STAGES:0];"
+                          if self.is_logically_partitioned else None)),
+
             ("heap_op_t", "reg_op_type_s[NUM_PIPELINE_STAGES:0];"),
             ("heap_entry_data_t", "reg_he_data_s[NUM_PIPELINE_STAGES:0];"),
         ])
@@ -376,7 +450,7 @@ class BBQ:
             if level.id > 1:
                 self.codegen.align_defs([
                     ("logic [BITMAP_L{}_AWIDTH-1:0]".format(level.id),
-                    "reg_l{}_addr_s[NUM_PIPELINE_STAGES:0];".format(level.id))
+                    "reg_{}_addr_s[NUM_PIPELINE_STAGES:0];".format(level.name()))
                 ])
         self.codegen.align_defs([
             ("op_color_t", "reg_op_color_s[NUM_PIPELINE_STAGES:0];"),
@@ -387,7 +461,7 @@ class BBQ:
             if level.id > 1:
                 self.codegen.align_defs([
                     ("bitmap_t",
-                    "reg_l{}_bitmap_s[NUM_PIPELINE_STAGES:0];".format(level.id))
+                    "reg_{}_bitmap_s[NUM_PIPELINE_STAGES:0];".format(level.name()))
                 ])
         self.codegen.align_defs([
             ("logic", "reg_is_deque_min_s[NUM_PIPELINE_STAGES:0];"),
@@ -396,6 +470,13 @@ class BBQ:
         self.codegen.emit()
 
         # Emit per-stage defs
+        if self.is_logically_partitioned:
+            self.codegen.comment("Stage 0 metadata")
+            self.codegen.align_defs([
+                ("bbq_id_t", "bbq_id_s0;")
+            ])
+            self.codegen.emit()
+
         for level in self.levels:
             level.emit_stage_defs(self.codegen)
 
@@ -407,12 +488,12 @@ class BBQ:
         for level in self.bitmap_levels:
             if level.sram_counters:
                 self.codegen.align_defs([
-                    ("logic", "counter_l{}_init_done_r;".format(level.id)),
+                    ("logic", "counter_{}_init_done_r;".format(level.name())),
                 ])
         for level in self.bitmap_levels:
             if level.sram_bitmap:
                 self.codegen.align_defs([
-                    ("logic", "bm_l{}_init_done_r;".format(level.id)),
+                    ("logic", "bm_{}_init_done_r;".format(level.name())),
                 ])
         self.codegen.align_defs([
             ("logic", "fl_init_done_r;"),
@@ -420,12 +501,12 @@ class BBQ:
         for level in self.bitmap_levels:
             if level.sram_counters:
                 self.codegen.align_defs([
-                    ("logic", "counter_l{}_init_done;".format(level.id)),
+                    ("logic", "counter_{}_init_done;".format(level.name())),
                 ])
         for level in self.bitmap_levels:
             if level.sram_bitmap:
                 self.codegen.align_defs([
-                    ("logic", "bm_l{}_init_done;".format(level.id)),
+                    ("logic", "bm_{}_init_done;".format(level.name())),
                 ])
         self.codegen.align_defs([
             ("logic", "fl_init_done;"),
@@ -437,8 +518,6 @@ class BBQ:
         self.codegen.align_defs([
             ("list_t", "int_pb_data;"),
             ("list_t", "int_pb_q;"),
-            ("counter_t", "int_bbq_occupancy;"),
-            ("logic [HEAP_ENTRY_AWIDTH-1:0]", "int_size;"),
         ])
         self.codegen.emit()
 
@@ -449,21 +528,21 @@ class BBQ:
 
             self.codegen.align_defs([
                 ("logic [HEAP_LOG_BITMAP_WIDTH-1:0]",
-                 "ffs_l{}_inst_msb[{}:0];".format(
-                    (level.id), (num_ffs_insts - 1))),
+                 "ffs_{}_inst_msb[{}:0];".format(
+                    level.name(), (num_ffs_insts - 1))),
 
                 ("logic [HEAP_LOG_BITMAP_WIDTH-1:0]",
-                 "ffs_l{}_inst_lsb[{}:0];".format(
-                    (level.id), (num_ffs_insts - 1))),
+                 "ffs_{}_inst_lsb[{}:0];".format(
+                    level.name(), (num_ffs_insts - 1))),
 
-                ("logic", ("ffs_l{}_inst_zero[{}:0];".
-                           format(level.id, (num_ffs_insts - 1)))),
+                ("logic", ("ffs_{}_inst_zero[{}:0];".
+                           format(level.name(), (num_ffs_insts - 1)))),
 
-                ("bitmap_t", ("ffs_l{}_inst_msb_onehot[{}:0];".
-                              format(level.id, (num_ffs_insts - 1)))),
+                ("bitmap_t", ("ffs_{}_inst_msb_onehot[{}:0];".
+                              format(level.name(), (num_ffs_insts - 1)))),
 
-                ("bitmap_t", ("ffs_l{}_inst_lsb_onehot[{}:0];".
-                              format(level.id, (num_ffs_insts - 1)))),
+                ("bitmap_t", ("ffs_{}_inst_lsb_onehot[{}:0];".
+                              format(level.name(), (num_ffs_insts - 1)))),
             ])
             self.codegen.emit()
 
@@ -494,6 +573,12 @@ class BBQ:
     def emit_combinational_default_assigns(self) -> None:
         """Emit default assignments."""
         # Per-level defaults
+        if self.is_logically_partitioned:
+            self.codegen.align_assignment("bbq_id_s0",
+                ["in_he_priority[HEAP_PRIORITY_BUCKETS_AWIDTH-1:",
+                 "              HEAP_PRIORITY_BUCKETS_LP_AWIDTH];"
+            ], "=")
+
         for level in self.levels:
             level.emit_combinational_default_assigns(self.codegen)
 
@@ -502,8 +587,6 @@ class BBQ:
         pb_end_cycle = self.levels[-1].end_cycle
         self.codegen.emit([
             "int_pb_q = pb_q_r;",
-            "int_size = size;",
-            "int_bbq_occupancy = bbq_occupancy;",
         ])
         self.codegen.emit()
 
@@ -537,33 +620,21 @@ class BBQ:
         self.codegen.emit()
         self.codegen.emit([
             "pb_rdwr_conflict = 0;",
+            "pb_rdaddress = priority_s{};".format(self.levels[-2].end_cycle),
             "int_pb_data = reg_pb_new_s{};".format(pb_end_cycle - 1),
             "pb_wraddress = reg_priority_s[{}];".format(pb_end_cycle - 1),
         ])
-        if self.num_bitmap_levels > 1:
-            self.codegen.align_assignment("pb_rdaddress", [
-                "{{reg_{}_addr_s[{}],".format(self.levels[-2].name(),
-                                              self.levels[-2].end_cycle - 1),
-
-                "reg_{}_bitmap_idx_s{}}};".format(self.levels[-2].name(),
-                                                  self.levels[-2].end_cycle - 1)
-            ], "=")
-        else:
-            self.codegen.emit(
-                "pb_rdaddress = reg_{}_bitmap_idx_s{};".format(
-                self.levels[-2].name(), self.levels[-2].end_cycle - 1))
-
         self.codegen.emit()
 
         for level in self.bitmap_levels:
             if level.sram_bitmap:
                 self.codegen.emit([
-                    "bm_l{}_rden = 0;".format(level.id),
+                    "bm_{}_rden = 0;".format(level.name()),
                 ])
         for level in self.bitmap_levels:
             if level.sram_counters:
                 self.codegen.emit([
-                    "counter_l{}_rden = 0;".format(level.id),
+                    "counter_{}_rden = 0;".format(level.name()),
                 ])
         if self.num_bitmap_levels > 1:
             self.codegen.emit()
@@ -590,22 +661,22 @@ class BBQ:
             if level.sram_bitmap:
                 self.codegen.comment("L{} bitmaps".format(level.id))
                 self.codegen.emit([
-                    "bm_l{}_data = 0;".format(level.id),
-                    ("bm_l{0}_wraddress = "
-                     "bm_l{0}_wraddress_counter_r;".format(level.id)),
+                    "bm_{}_data = 0;".format(level.name()),
+                    ("bm_{0}_wraddress = "
+                     "bm_{0}_wraddress_counter_r;".format(level.name())),
                 ])
                 self.codegen.start_conditional("if",
-                    "!bm_l{}_init_done_r".format(level.id))
+                    "!bm_{}_init_done_r".format(level.name()))
 
                 done_condition_list[-1] += " & "
-                done_condition_list.append("bm_l{}_init_done_r".format(level.id))
+                done_condition_list.append("bm_{}_init_done_r".format(level.name()))
 
                 self.codegen.emit([
-                    "bm_l{}_wren = 1;".format(level.id),
+                    "bm_{}_wren = 1;".format(level.name()),
                 ])
                 self.codegen.align_assignment(
-                    "bm_l{}_init_done".format(level.id),
-                    ["(bm_l{}_wraddress_counter_r ==".format(level.id),
+                    "bm_{}_init_done".format(level.name()),
+                    ["(bm_{}_wraddress_counter_r ==".format(level.name()),
                      "(NUM_BITMAPS_L{} - 1));".format(level.id)], "=")
 
                 self.codegen.end_conditional("if")
@@ -613,22 +684,22 @@ class BBQ:
             if level.sram_counters:
                 self.codegen.comment("L{} counters".format(level.id))
                 self.codegen.emit([
-                    "counter_l{}_data = 0;".format(level.id),
-                    ("counter_l{0}_wraddress = "
-                     "counter_l{0}_wraddress_counter_r;".format(level.id)),
+                    "counter_{}_data = 0;".format(level.name()),
+                    ("counter_{0}_wraddress = "
+                     "counter_{0}_wraddress_counter_r;".format(level.name())),
                 ])
                 self.codegen.start_conditional("if",
-                    "!counter_l{}_init_done_r".format(level.id))
+                    "!counter_{}_init_done_r".format(level.name()))
 
                 done_condition_list[-1] += " & "
-                done_condition_list.append("counter_l{}_init_done_r".format(level.id))
+                done_condition_list.append("counter_{}_init_done_r".format(level.name()))
 
                 self.codegen.emit([
-                    "counter_l{}_wren = 1;".format(level.id),
+                    "counter_{}_wren = 1;".format(level.name()),
                 ])
                 self.codegen.align_assignment(
-                    "counter_l{}_init_done".format(level.id),
-                    ["(counter_l{}_wraddress_counter_r ==".format(level.id),
+                    "counter_{}_init_done".format(level.name()),
+                    ["(counter_{}_wraddress_counter_r ==".format(level.name()),
                      "(NUM_COUNTERS_L{} - 1));".format(level.id)], "=")
 
                 self.codegen.end_conditional("if")
@@ -659,14 +730,14 @@ class BBQ:
         for level in self.bitmap_levels:
             if level.sram_bitmap:
                 self.codegen.emit([
-                    "bm_l{0}_init_done = "
-                    "bm_l{0}_init_done_r;".format(level.id),
+                    "bm_{0}_init_done = "
+                    "bm_{0}_init_done_r;".format(level.name()),
                 ])
         for level in self.bitmap_levels:
             if level.sram_counters:
                 self.codegen.emit([
-                    "counter_l{0}_init_done = "
-                    "counter_l{0}_init_done_r;".format(level.id),
+                    "counter_{0}_init_done = "
+                    "counter_{0}_init_done_r;".format(level.name()),
                 ])
         self.codegen.emit()
 
@@ -676,12 +747,12 @@ class BBQ:
         for level in self.bitmap_levels:
             if level.sram_bitmap:
                 self.codegen.emit([
-                    "bm_l{}_wren = 0;".format(level.id),
+                    "bm_{}_wren = 0;".format(level.name()),
                 ])
         for level in self.bitmap_levels:
             if level.sram_counters:
                 self.codegen.emit([
-                    "counter_l{}_wren = 0;".format(level.id),
+                    "counter_{}_wren = 0;".format(level.name()),
                 ])
         self.codegen.emit()
 
@@ -724,8 +795,16 @@ class BBQ:
 
     def emit_sequential_rst_state(self) -> None:
         """Emits the reset state logic."""
-        self.codegen.comment("Reset BBQ occupancy")
-        self.codegen.emit("bbq_occupancy <= 0;")
+        self.codegen.comment("Reset occupancy")
+        if self.is_logically_partitioned:
+            self.codegen.start_for(
+                "i", "i < HEAP_NUM_LPS"
+            )
+            self.codegen.emit("occupancy[i] <= 0;")
+            self.codegen.end_for()
+        else:
+            self.codegen.emit("occupancy <= 0;")
+
         self.codegen.emit()
 
         self.codegen.comment("Reset bitmaps")
@@ -737,14 +816,14 @@ class BBQ:
                     self.codegen.start_for(
                         "i", "i < NUM_BITMAPS_L{}".format(level.id))
 
-                    self.codegen.emit("l{}_bitmaps[i] <= 0;".format(level.id))
+                    self.codegen.emit("{}_bitmaps[i] <= 0;".format(level.name()))
                     self.codegen.end_for()
 
             if not level.sram_counters:
                 self.codegen.start_for(
                     "i", "i < NUM_COUNTERS_L{}".format(level.id))
 
-                self.codegen.emit("l{}_counters[i] <= 0;".format(level.id))
+                self.codegen.emit("{}_counters[i] <= 0;".format(level.name()))
                 self.codegen.end_for()
 
         self.codegen.emit()
@@ -761,7 +840,7 @@ class BBQ:
         for level in self.bitmap_levels:
             if level.sram_bitmap:
                 self.codegen.emit([
-                    "bm_l{0}_init_done_r <= 0;".format(level.id),
+                    "bm_{}_init_done_r <= 0;".format(level.name()),
                 ])
         self.codegen.emit([
             "fl_wraddress_counter_r <= 0;",
@@ -769,30 +848,33 @@ class BBQ:
         for level in self.bitmap_levels:
             if level.sram_counters:
                 self.codegen.emit([
-                    "counter_l{0}_init_done_r <= 0;".format(level.id),
+                    "counter_{}_init_done_r <= 0;".format(level.name()),
                 ])
         for level in self.bitmap_levels:
             if level.sram_bitmap:
                 self.codegen.emit([
-                    "bm_l{0}_wraddress_counter_r <= 0;".format(level.id),
+                    "bm_{}_wraddress_counter_r <= 0;".format(level.name()),
                 ])
         for level in self.bitmap_levels:
             if level.sram_counters:
                 self.codegen.emit([
-                    "counter_l{0}_wraddress_counter_r <= 0;".format(level.id),
+                    "counter_{}_wraddress_counter_r <= 0;".format(level.name()),
                 ])
 
         self.codegen.emit()
-        self.codegen.comment("Reset FSM state and size")
+        self.codegen.comment("Reset FSM state")
         self.codegen.emit([
             "state <= FSM_STATE_INIT;",
-            "size <= 0;",
         ])
 
 
     def emit_sequential_common_logic(self) -> None:
         """Emit misc assigns and global logic."""
         self.codegen.comment("Stage 0: Register inputs.", True)
+
+        if self.is_logically_partitioned:
+            self.codegen.emit("reg_bbq_id_s[0] <= bbq_id_s0;")
+
         self.codegen.emit([
             "reg_op_type_s[0] <= in_op_type;",
             "reg_he_data_s[0] <= in_he_data;",
@@ -805,26 +887,33 @@ class BBQ:
         self.codegen.emit()
 
         self.codegen.start_ifdef("DEBUG")
+        id_str = (" (logical ID: %0d)"
+                  if self.is_logically_partitioned else "")
+
+        id_val = ("bbq_id_s0, "
+                  if self.is_logically_partitioned else "")
+
+        priority_str_prefix = ("relative "
+                               if self.is_logically_partitioned else "")
+
+        priority_val_suffix = (" & (HEAP_NUM_PRIORITIES_PER_LP - 1)"
+                               if self.is_logically_partitioned else "")
+
         self.codegen.start_conditional("if", "in_valid")
         self.codegen.start_conditional("if", "in_op_type == HEAP_OP_ENQUE")
         self.codegen.emit([
-            "$display(\"[BBQ] At S0, enqueing %0d with priority %0d\",",
-            "         in_he_data, in_he_priority);",
+            ("$display(\"[BBQ] At S0{}, enqueing %0d with {}priority %0d\","
+             .format(id_str, priority_str_prefix)),
+
+            ("         {}in_he_data, in_he_priority{});"
+             .format(id_val, priority_val_suffix)),
         ])
         self.codegen.end_conditional("if")
-        self.codegen.start_conditional(
-            "else if", "in_op_type == HEAP_OP_DEQUE_MIN")
-
-        self.codegen.emit([
-            "$display(\"[BBQ] At S0, dequeing-min, heap size is: %0d, \",",
-            "         size, \"L1 bitmap is: %b\", l1_bitmap);",
-        ])
-        self.codegen.end_conditional("else if")
         self.codegen.start_conditional("else", None)
 
         self.codegen.emit([
-            "$display(\"[BBQ] At S0, dequeing-max, heap size is: %0d, \",",
-            "         size, \"L1 bitmap is: %b\", l1_bitmap);",
+            "$display(\"[BBQ] At S0{}, performing %s\",".format(id_str),
+            "         {}in_op_type.name);".format(id_val),
         ])
         self.codegen.end_conditional("else")
         self.codegen.end_conditional("if")
@@ -847,10 +936,10 @@ class BBQ:
         done_signals = ["fl_init_done"]
         for level in self.bitmap_levels:
             if level.sram_bitmap:
-                done_signals.append("bm_l{}_init_done".format(level.id))
+                done_signals.append("bm_{}_init_done".format(level.name()))
 
             if level.sram_counters:
-                done_signals.append("counter_l{}_init_done".format(level.id))
+                done_signals.append("counter_{}_init_done".format(level.name()))
 
         for signal in sorted(done_signals, key=lambda x: len(x)):
             self.codegen.emit("{0}_r <= {0};".format(signal))
@@ -861,11 +950,11 @@ class BBQ:
         for level in self.bitmap_levels:
             if level.sram_bitmap:
                 counter_signals.append(
-                    "bm_l{}_wraddress_counter_r".format(level.id))
+                    "bm_{}_wraddress_counter_r".format(level.name()))
 
             if level.sram_counters:
                 counter_signals.append(
-                    "counter_l{}_wraddress_counter_r".format(level.id))
+                    "counter_{}_wraddress_counter_r".format(level.name()))
 
         for signal in sorted(counter_signals, key=lambda x: len(x)):
             self.codegen.emit("{0} <= {0} + 1;".format(signal))
@@ -914,6 +1003,31 @@ class BBQ:
 
         self.codegen.comment("Update FSM state")
         self.codegen.emit("state <= state_next;")
+
+
+    def emit_sequential_primary_signals(self, cycle: int,
+                      value_override: dict=None) -> None:
+        """Emits the primary pipeline signals."""
+        if value_override is None:
+            value_override = dict()
+
+        signals = ["reg_valid_s",
+                   "reg_he_data_s",
+                   "reg_op_type_s",
+                   "reg_is_enque_s",
+                   "reg_priority_s",
+                   "reg_is_deque_max_s",
+                   "reg_is_deque_min_s"]
+
+        if self.is_logically_partitioned:
+            signals.insert(1, "reg_bbq_id_s")
+
+        for signal in signals:
+            v = value_override.get(signal)
+            if not v: v = "{}[{}]".format(signal, cycle - 1)
+            self.codegen.emit("{}[{}] <= {};".format(signal, cycle, v))
+
+        self.codegen.emit()
 
 
     def emit_sequential_pipeline_logic(self) -> None:
@@ -1046,14 +1160,14 @@ class BBQ:
                     "    .DEPTH(NUM_BITMAPS_L{}),".format(level.id),
                     "    .IS_OUTDATA_REG(0)",
                     ")",
-                    "bm_l{} (".format(level.id),
+                    "bm_{} (".format(level.name()),
                     "    .clock(clk),",
-                    "    .data(bm_l{}_data),".format(level.id),
-                    "    .rden(bm_l{}_rden),".format(level.id),
-                    "    .wren(bm_l{}_wren),".format(level.id),
-                    "    .rdaddress(bm_l{}_rdaddress),".format(level.id),
-                    "    .wraddress(bm_l{}_wraddress),".format(level.id),
-                    "    .q(bm_l{}_q)".format(level.id),
+                    "    .data(bm_{}_data),".format(level.name()),
+                    "    .rden(bm_{}_rden),".format(level.name()),
+                    "    .wren(bm_{}_wren),".format(level.name()),
+                    "    .rdaddress(bm_{}_rdaddress),".format(level.name()),
+                    "    .wraddress(bm_{}_wraddress),".format(level.name()),
+                    "    .q(bm_{}_q)".format(level.name()),
                     ");",
                 ])
                 self.codegen.emit()
@@ -1068,14 +1182,14 @@ class BBQ:
                     "    .DEPTH(NUM_COUNTERS_L{}),".format(level.id),
                     "    .IS_OUTDATA_REG(0)",
                     ")",
-                    "counters_l{} (".format(level.id),
+                    "counters_{} (".format(level.name()),
                     "    .clock(clk),",
-                    "    .data(counter_l{}_data),".format(level.id),
-                    "    .rden(counter_l{}_rden),".format(level.id),
-                    "    .wren(counter_l{}_wren),".format(level.id),
-                    "    .rdaddress(counter_l{}_rdaddress),".format(level.id),
-                    "    .wraddress(counter_l{}_wraddress),".format(level.id),
-                    "    .q(counter_l{}_q)".format(level.id),
+                    "    .data(counter_{}_data),".format(level.name()),
+                    "    .rden(counter_{}_rden),".format(level.name()),
+                    "    .wren(counter_{}_wren),".format(level.name()),
+                    "    .rdaddress(counter_{}_rdaddress),".format(level.name()),
+                    "    .wraddress(counter_{}_wraddress),".format(level.name()),
+                    "    .q(counter_{}_q)".format(level.name()),
                     ");",
                 ])
                 self.codegen.emit()
@@ -1088,23 +1202,23 @@ class BBQ:
                 cycle = (level.start_cycle +
                          int(level.sram_bitmap) + j - 1)
 
-                bitmap = ("reg_l{}_bitmap_postop_s{}"
-                          .format(level.id, cycle))
+                bitmap = ("reg_{}_bitmap_postop_s{}"
+                          .format(level.name(), cycle))
                 if j == 0:
                     bitmap = ("l1_bitmap" if (level.id == 1) else
-                              "reg_l{}_bitmap_s[{}]".format(level.id, cycle))
+                              "reg_{}_bitmap_s[{}]".format(level.name(), cycle))
 
                 self.codegen.emit([
                     "ffs #(",
                     "    .WIDTH_LOG(HEAP_LOG_BITMAP_WIDTH)",
                     ")",
-                    "ffs_l{}_inst{} (".format(level.id, j),
+                    "ffs_{}_inst{} (".format(level.name(), j),
                     "    .x({}),".format(bitmap),
-                    "    .msb(ffs_l{}_inst_msb[{}]),".format(level.id, j),
-                    "    .lsb(ffs_l{}_inst_lsb[{}]),".format(level.id, j),
-                    "    .msb_onehot(ffs_l{}_inst_msb_onehot[{}]),".format(level.id, j),
-                    "    .lsb_onehot(ffs_l{}_inst_lsb_onehot[{}]),".format(level.id, j),
-                    "    .zero(ffs_l{}_inst_zero[{}])".format(level.id, j),
+                    "    .msb(ffs_{}_inst_msb[{}]),".format(level.name(), j),
+                    "    .lsb(ffs_{}_inst_lsb[{}]),".format(level.name(), j),
+                    "    .msb_onehot(ffs_{}_inst_msb_onehot[{}]),".format(level.name(), j),
+                    "    .lsb_onehot(ffs_{}_inst_lsb_onehot[{}]),".format(level.name(), j),
+                    "    .zero(ffs_{}_inst_zero[{}])".format(level.name(), j),
                     ");",
                 ])
                 self.codegen.emit()
@@ -1135,8 +1249,10 @@ if __name__ == "__main__":
                                  "for the specified number of bitmap tree levels."))
 
     parser.add_argument("num_bitmap_levels", type=int)
+    parser.add_argument("--num_lps", type=int, default=1)
+    parser.add_argument("--bitmap_width", type=int, default=0)
     args = parser.parse_args()
 
-    bbq = BBQ(args.num_bitmap_levels)
+    bbq = BBQ(args.num_bitmap_levels, args.num_lps, args.bitmap_width)
     bbq.generate()
     print(bbq.codegen.out)

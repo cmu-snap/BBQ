@@ -9,7 +9,6 @@ class CodeGen:
         self.out = ""                       # Emitted code
         self.level = 0                      # Current indent level
         self.spacing = 4                    # Spacing per indent level
-        self.alignto = 36                   # Spacing for aligned defs
         self.stack = deque()                # Stack for tracking blocks
 
 
@@ -50,13 +49,13 @@ class CodeGen:
                              if indent_first else x)
 
         elif isinstance(x, list):
-            assert len(x) > 0 # Sanity check
-            self.out += (self._format_str(x[0], offset)
-                         if indent_first else x[0])
+            first = True
+            for v in x:
+                if v is None: continue
+                self.out += ((self._format_str(v, offset) if indent_first else v)
+                             if first else "\n{}".format(self._format_str(v, offset)))
 
-            for i in range(1, len(x)):
-                self.out += "\n{}".format(
-                    self._format_str(x[i], offset))
+                first = False # First valid value
 
         # Sanity check
         else: assert False
@@ -114,10 +113,11 @@ class CodeGen:
         self.emit(rhs, False, offset, True)
 
 
-    def align_defs(self, defs: List[Tuple]) -> None:
+    def align_defs(self, defs: List[Tuple], align : int=40) -> None:
         """Emit tab-aligned definitions."""
         for (lhs, rhs) in defs:
-            padding = self.alignto - len(lhs)
+            if rhs is None: continue
+            padding = align - len(lhs)
             assert padding > 0 # Sanity check
             self.emit(lhs + (" " * padding) + rhs)
 

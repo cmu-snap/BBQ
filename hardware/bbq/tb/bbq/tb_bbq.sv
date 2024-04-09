@@ -72,7 +72,6 @@ heap_entry_data_t heap_in_data;
 heap_entry_data_t heap_out_data;
 heap_priority_t heap_in_priority;
 heap_priority_t heap_out_priority;
-logic [HEAP_ENTRY_AWIDTH-1:0] heap_size;
 
 integer i;
 
@@ -111,7 +110,7 @@ always @(posedge clk) begin
             end
             else begin
                 $display("FAIL %s: Expected ", `TEST_CASE,
-                         "(op: HEAP_OP_ENQUE, data: 23, priority: %d)",
+                         "(op: HEAP_OP_ENQUE, data: 23, priority: %0d)",
                          (HEAP_NUM_PRIORITIES - 1), ", got (%s, %0d, %0d)",
                          heap_out_op_type.name, heap_out_data, heap_out_priority);
                 $finish;
@@ -159,7 +158,7 @@ always @(posedge clk) begin
             end
             else begin
                 $display("FAIL %s: Expected ", `TEST_CASE,
-                         "(op: HEAP_OP_DEQUE_MIN, data: 42, priority: %d), got",
+                         "(op: HEAP_OP_DEQUE_MIN, data: 42, priority: %0d), got",
                          PRIORITY, " (%s, %0d, %0d)", heap_out_op_type.name,
                          heap_out_data, heap_out_priority);
                 $finish;
@@ -293,7 +292,7 @@ always @(posedge clk) begin
                 end
                 else begin
                     $display("FAIL %s: Expected ", `TEST_CASE,
-                             "(op: HEAP_OP_DEQUE_MIN, data: 3, priority: %d), got",
+                             "(op: HEAP_OP_DEQUE_MIN, data: 3, priority: %0d), got",
                              PRIORITY_3, " (%s, %0d, %0d)", heap_out_op_type.name,
                              heap_out_data, heap_out_priority);
                     $finish;
@@ -313,7 +312,7 @@ always @(posedge clk) begin
                 end
                 else begin
                     $display("FAIL %s: Expected ", `TEST_CASE,
-                             "(op: HEAP_OP_DEQUE_MAX, data: 4, priority: %d), got",
+                             "(op: HEAP_OP_DEQUE_MAX, data: 4, priority: %0d), got",
                              PRIORITY_4, " (%s, %0d, %0d)", heap_out_op_type.name,
                              heap_out_data, heap_out_priority);
                     $finish;
@@ -1507,7 +1506,7 @@ always @(posedge clk) begin
         end
     end
     else if (rst_issued && heap_ready) begin
-        if (heap_size !== 0) begin
+        if (bbq_inst.occupancy !== 0) begin
             $display("FAIL %s: Heap size is non-zero post reset", `TEST_CASE);
             $finish;
         end
@@ -1567,8 +1566,7 @@ bbq_inst (
     .out_valid(heap_out_valid),
     .out_op_type(heap_out_op_type),
     .out_he_data(heap_out_data),
-    .out_he_priority(heap_out_priority),
-    .size(heap_size)
+    .out_he_priority(heap_out_priority)
 );
 
 endmodule

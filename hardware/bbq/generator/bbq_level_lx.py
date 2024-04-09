@@ -1,14 +1,22 @@
 #!/usr/bin/python3
+from __future__ import annotations
+
+import typing
+
 from bbq_level import BBQLevel
 from bbq_level_pb import BBQLevelPB
 from codegen import CodeGen
 
+# Hack for type hinting with circular imports
+if typing.TYPE_CHECKING: from bbq import BBQ
+
 
 class BBQLevelLX(BBQLevel):
     """Represents an LX BBQ level."""
-    def __init__(self, start_cycle: int, num_bitmap_levels: int, level_id: int,
+    def __init__(self, bbq: BBQ, start_cycle: int, level_id: int,
                  sram_bitmap: bool, sram_counters: bool) -> None:
-        super().__init__(start_cycle, num_bitmap_levels)
+
+        super().__init__(bbq, start_cycle)
 
         self.level_id = level_id            # BBQ Level (>= 1)
         self.sram_bitmap = sram_bitmap      # Store bitmap in SRAM?
@@ -90,8 +98,8 @@ class BBQLevelLX(BBQLevel):
         if self.level_id > 1:
             for offset in range(1, 5):
                 cg.align_defs([
-                    ("logic", "reg_l{}_addr_conflict_s{}_s{};"
-                     .format(self.level_id, (cycle + offset), cycle))
+                    ("logic", "reg_{}_addr_conflict_s{}_s{};"
+                     .format(self.name(), (cycle + offset), cycle))
                 ])
         cg.emit()
         cycle += 1
@@ -122,6 +130,10 @@ class BBQLevelLX(BBQLevel):
 
         # Write-back counter, bitmap
         cg.comment("Stage {} metadata".format(cycle))
+        if self.is_leaf:
+            cg.align_defs([
+                ("heap_priority_t", "priority_s{};".format(cycle)),
+            ])
         if not self.sram_bitmap:
             cg.align_defs([
                 ("bitmap_t", "{}_bitmap_s{};".format(self.name(), cycle))
@@ -146,7 +158,7 @@ class BBQLevelLX(BBQLevel):
         if self.is_leaf:
             cg.align_defs([
                 ("counter_t", "reg_old_{}_counter_s{};".format(self.name(), cycle)),
-                ("logic", "reg_{}_counter_non_zero_s{};".format(self.name(), cycle))
+                ("logic", "reg_{}_counter_non_zero_s{};".format(self.name(), cycle)),
             ])
         for offset in range(1, 5):
             cg.align_defs([
@@ -237,6 +249,13 @@ class BBQLevelLX(BBQLevel):
             cycle += 1
 
         # Write-back counter, bitmap
+        if self.is_leaf:
+            if self.level_id == 1:
+                cg.emit("priority_s{} = reg_{}_bitmap_idx_s{};"
+                        .format(cycle, self.name(), cycle - 1))
+            else:
+                cg.emit("priority_s{0} = {{reg_{1}_addr_s[{2}], reg_{1}_bitmap_idx_s{2}}};"
+                        .format(cycle, self.name(), cycle - 1))
         cycle += 1
 
 
@@ -311,9 +330,10 @@ class BBQLevelLX(BBQLevel):
 
         elif self.next_level.sram_bitmap:
             cg.comment("Read L{} bitmap".format(self.level_id + 1))
-            cg.emit("bm_l{}_rden = reg_valid_s[{}];".format(self.level_id + 1, seq_cycle))
+            cg.emit("bm_{}_rden = reg_valid_s[{}];".format(
+                self.next_level.name(), seq_cycle))
 
-            rdaddress_lhs = "bm_l{}_rdaddress".format(self.level_id + 1)
+            rdaddress_lhs = "bm_{}_rdaddress".format(self.next_level.name())
             rdaddress_rhs_idx_term = ("reg_{}_bitmap_idx_s{}".format(
                                       self.name(), seq_cycle))
 
@@ -338,13 +358,14 @@ class BBQLevelLX(BBQLevel):
                      .format(self.next_level.name(),
                              seq_cycle + 1 + offset,
                              seq_cycle + 1)),
-                ["(",
-                 ("reg_valid_s[{}] && reg_valid_s[{}] &&"
-                  .format(seq_cycle, seq_cycle + offset)),
+                    ["(",
+                    ("reg_valid_s[{}] && reg_valid_s[{}] &&"
+                    .format(seq_cycle, seq_cycle + offset)),
 
-                 ("(reg_l1_bitmap_idx_s{} == reg_{}_s[{}]));"
-                  .format(seq_cycle, rhs_addr_midfix, seq_cycle + offset))
-                ], "=", True)
+                    ("(reg_l1_bitmap_idx_s{} == reg_{}_s[{}]));"
+                    .format(seq_cycle, rhs_addr_midfix, seq_cycle + offset))
+                    ],
+                "=", True)
                 cg.emit()
 
         else:
@@ -710,23 +731,6 @@ class BBQLevelLX(BBQLevel):
             seq_cycle -= 1
 
 
-    def emit_sequential_primary_signals(self, cg: CodeGen, cycle: int,
-                                        value_override: dict=dict()) -> None:
-        """Emits the primary pipeline signals."""
-        signals = ["reg_valid_s",
-                   "reg_he_data_s",
-                   "reg_op_type_s",
-                   "reg_is_enque_s",
-                   "reg_priority_s",
-                   "reg_is_deque_max_s",
-                   "reg_is_deque_min_s"]
-
-        for signal in signals:
-            v = value_override.get(signal)
-            if not v: v = "{}[{}]".format(signal, cycle - 1)
-            cg.emit("{}[{}] <= {};".format(signal, cycle, v))
-
-
     def emit_sequential_pipeline_logic(self, cg: CodeGen) -> None:
         """Emit sequential logic for this level."""
 
@@ -743,16 +747,13 @@ class BBQLevelLX(BBQLevel):
                 "PB (head and tail)" if self.is_leaf else
                     "L{} bitmap".format(self.level_id + 1))),
         ], True)
+
         value_override = {}
-        if self.is_leaf: value_override["reg_priority_s"] = "pb_rdaddress"
+        if self.is_leaf: value_override[
+            "reg_priority_s"] = "priority_s{}".format(cycle)
+        self.bbq.emit_sequential_primary_signals(cycle, value_override)
 
-        self.emit_sequential_primary_signals(
-            cg, cycle, value_override)
-
-        cg.emit()
-        reg_bitmap_idx = ("reg_{}_bitmap_idx_s{}"
-                          .format(self.name(), cycle - 1))
-
+        reg_bitmap_idx = ("reg_{}_bitmap_idx_s{}".format(self.name(), cycle - 1))
         emit_newline = False
         if self.level_id > 1:
             cg.emit(
@@ -762,13 +763,17 @@ class BBQLevelLX(BBQLevel):
                          if self.sram_bitmap else
                          "{}_bitmap_s{}".format(self.name(), cycle))))
 
-            for i in range(2, self.level_id + 1):
+            for level in self.bbq.bitmap_levels:
+                if level.id < 2: continue
+                elif level.id > self.level_id: break
                 cg.emit("{0}[{1}] <= {0}[{2}];".format(
-                    "reg_l{}_addr_s".format(i), cycle, cycle - 1))
+                    "reg_{}_addr_s".format(level.name()), cycle, cycle - 1))
 
-            for i in range(2, self.level_id):
+            for level in self.bbq.bitmap_levels:
+                if level.id < 2: continue
+                elif level.id >= self.level_id: break
                 cg.emit("{0}[{1}] <= {0}[{2}];".format(
-                    "reg_l{}_bitmap_s".format(i), cycle, cycle - 1))
+                    "reg_{}_bitmap_s".format(level.name()), cycle, cycle - 1))
 
             emit_newline = True
 
@@ -867,15 +872,21 @@ class BBQLevelLX(BBQLevel):
             cg.emit()
 
         cg.start_ifdef("DEBUG")
+        id_str_prefix = ("logical ID: %0d, "
+                         if self.bbq.is_logically_partitioned else "")
+
+        id_val_prefix = ("reg_bbq_id_s[{}], ".format(cycle - 1)
+                         if self.bbq.is_logically_partitioned else "")
+
         if self.level_id == 1:
             cg.start_conditional("if", "reg_valid_s[{}]".format(cycle - 1))
             cg.emit("$display(")
             cg.emit([
-                ("\"[BBQ] At S{} (op: %s), updating L1 counter (L1_idx = %0d) to %0d\","
-                 .format(cycle)),
+                ("\"[BBQ] At S{} ({}op: %s), updating L1 counter (L1_idx = %0d) to %0d\","
+                 .format(cycle, id_str_prefix)),
 
-                ("reg_op_type_s[{}].name, {}, {}_counter_s{}[WATERLEVEL_IDX-1:0]);"
-                 .format(cycle - 1, reg_bitmap_idx, self.name(), cycle)),
+                ("{}reg_op_type_s[{}].name, {}, {}_counter_s{}[WATERLEVEL_IDX-1:0]);"
+                 .format(id_val_prefix, cycle - 1, reg_bitmap_idx, self.name(), cycle)),
             ], True, 4)
             cg.end_conditional("if")
 
@@ -883,11 +894,11 @@ class BBQLevelLX(BBQLevel):
             cg.start_conditional("if", "reg_valid_s[{}]".format(cycle - 1))
             cg.emit("$display(")
             cg.emit([
-                ("\"[BBQ] At S{0} (op: %s), updating L{1} counter "
-                 "(L{1}_addr, L{1}_idx) \",".format(cycle, self.level_id)),
+                ("\"[BBQ] At S{0} ({1}op: %s), updating L{2} counter "
+                 "(L{2}_addr, L{2}_idx) \",".format(cycle, id_str_prefix, self.level_id)),
 
-                ("reg_op_type_s[{0}].name, \"= (%0d, %0d) to %0d\", "
-                 "reg_{1}_addr_s[{0}],".format(cycle - 1, self.name())),
+                ("{0}reg_op_type_s[{1}].name, \"= (%0d, %0d) to %0d\", "
+                 "reg_{2}_addr_s[{1}],".format(id_val_prefix, cycle - 1, self.name())),
 
                 ("{}, {}_counter_s{}[WATERLEVEL_IDX-1:0]);"
                  .format(reg_bitmap_idx, self.name(), cycle))
@@ -903,16 +914,19 @@ class BBQLevelLX(BBQLevel):
             cg.comment("Stage {}: NOOP, read delay for L{} counter."
                        .format(cycle, self.level_id), True)
 
-            self.emit_sequential_primary_signals(cg, cycle)
-            cg.emit()
+            self.bbq.emit_sequential_primary_signals(cycle)
 
-            for i in range(2, self.level_id + 1):
+            for level in self.bbq.bitmap_levels:
+                if level.id < 2: continue
+                elif level.id > self.level_id: break
                 cg.emit("{0}[{1}] <= {0}[{2}];".format(
-                    "reg_l{}_addr_s".format(i), cycle, cycle - 1))
+                    "reg_{}_addr_s".format(level.name()), cycle, cycle - 1))
 
-            for i in range(2, self.level_id):
+            for level in self.bbq.bitmap_levels:
+                if level.id < 2: continue
+                elif level.id >= self.level_id: break
                 cg.emit("{0}[{1}] <= {0}[{2}];".format(
-                    "reg_l{}_bitmap_s".format(i), cycle, cycle - 1))
+                    "reg_{}_bitmap_s".format(level.name()), cycle, cycle - 1))
 
             for offset in range(1, 5):
                 cg.emit(
@@ -984,14 +998,20 @@ class BBQLevelLX(BBQLevel):
                 cg.emit()
 
             cg.start_ifdef("DEBUG")
+            id_str_prefix = ("logical ID: %0d, "
+                             if self.bbq.is_logically_partitioned else "")
+
+            id_val_prefix = ("reg_bbq_id_s[{}], ".format(cycle - 1)
+                             if self.bbq.is_logically_partitioned else "")
+
             cg.start_conditional("if", "reg_valid_s[{}]".format(cycle - 1))
             cg.emit("$display(")
             cg.emit([
-                ("\"[BBQ] At S{} (op: %s) for (L{} addr = %0d),\","
-                 .format(cycle, self.level_id)),
+                ("\"[BBQ] At S{} ({}op: %s) for (L{} addr = %0d),\","
+                 .format(cycle, id_str_prefix, self.level_id)),
 
-                ("reg_op_type_s[{0}].name, reg_{1}_addr_s[{0}],"
-                 .format(cycle - 1, self.name())),
+                ("{0}reg_op_type_s[{1}].name, reg_{2}_addr_s[{1}],"
+                 .format(id_val_prefix, cycle - 1, self.name())),
 
                 "\" RCD is %s\", rcd_s{}.name);".format(cycle)
             ], True, 4)
@@ -1009,16 +1029,19 @@ class BBQLevelLX(BBQLevel):
             .format(self.level_id))
         ], True)
 
-        self.emit_sequential_primary_signals(cg, cycle)
-        cg.emit()
+        self.bbq.emit_sequential_primary_signals(cycle)
 
-        for i in range(2, self.level_id + 1):
+        for level in self.bbq.bitmap_levels:
+            if level.id < 2: continue
+            elif level.id > self.level_id: break
             cg.emit("{0}[{1}] <= {0}[{2}];".format(
-                "reg_l{}_addr_s".format(i), cycle, cycle - 1))
+                "reg_{}_addr_s".format(level.name()), cycle, cycle - 1))
 
-        for i in range(2, self.level_id):
+        for level in self.bbq.bitmap_levels:
+            if level.id < 2: continue
+            elif level.id >= self.level_id: break
             cg.emit("{0}[{1}] <= {0}[{2}];".format(
-                "reg_l{}_bitmap_s".format(i), cycle, cycle - 1))
+                "reg_{}_bitmap_s".format(level.name()), cycle, cycle - 1))
 
         if self.level_id > 1:
             for offset in range(1, 5):
@@ -1139,24 +1162,29 @@ class BBQLevelLX(BBQLevel):
             cg.emit()
 
         cg.start_ifdef("DEBUG")
+        id_str_prefix = ("logical ID: %0d, "
+                         if self.bbq.is_logically_partitioned else "")
+
+        id_val_prefix = ("reg_bbq_id_s[{}], ".format(cycle - 1)
+                         if self.bbq.is_logically_partitioned else "")
+
         cg.start_conditional("if", "reg_valid_s[{}]".format(cycle - 1))
         cg.emit("$display(")
         if self.level_id > 1:
             cg.emit([
-                ("\"[BBQ] At S{} (op: %s) for (L{} addr = %0d),\","
-                 .format(cycle, self.level_id)),
+                ("\"[BBQ] At S{} ({}op: %s) for (L{} addr = %0d),\","
+                 .format(cycle, id_str_prefix, self.level_id)),
 
-                ("reg_op_type_s[{0}].name, reg_{1}_addr_s[{0}],"
-                 .format(cycle - 1, self.name())),
+                ("{0}reg_op_type_s[{1}].name, reg_{2}_addr_s[{1}],"
+                 .format(id_val_prefix, cycle - 1, self.name())),
 
                 "\" RCD is %s\", rcd_s{}.name);".format(cycle)
             ], True, 4)
 
         else:
             cg.emit([
-                ("\"[BBQ] At S{} (op: %s),\", reg_op_type_s[{}].name,"
-                 .format(cycle, cycle - 1)),
-
+                "\"[BBQ] At S{} ({}op: %s),\",".format(cycle, id_str_prefix),
+                "{}reg_op_type_s[{}].name,".format(id_val_prefix, cycle - 1),
                 "\" RCD is %s\", rcd_s{}.name);".format(cycle)
             ], True, 4)
 
@@ -1171,19 +1199,21 @@ class BBQLevelLX(BBQLevel):
             cg.comment("Stage {}: NOOP, read delay for L{} bitmap."
                        .format(cycle, self.level_id), True)
 
-            self.emit_sequential_primary_signals(cg, cycle)
-            cg.emit()
-
+            self.bbq.emit_sequential_primary_signals(cycle)
             cg.emit("reg_{0}[{1}] <= {0}{1};".format(
                     "{}_bitmap_s".format(self.name()), cycle))
 
-            for i in range(2, self.level_id + 1):
+            for level in self.bbq.bitmap_levels:
+                if level.id < 2: continue
+                elif level.id > self.level_id: break
                 cg.emit("{0}[{1}] <= {0}[{2}];".format(
-                    "reg_l{}_addr_s".format(i), cycle, cycle - 1))
+                    "reg_{}_addr_s".format(level.name()), cycle, cycle - 1))
 
-            for i in range(2, self.level_id):
+            for level in self.bbq.bitmap_levels:
+                if level.id < 2: continue
+                elif level.id >= self.level_id: break
                 cg.emit("{0}[{1}] <= {0}[{2}];".format(
-                    "reg_l{}_bitmap_s".format(i), cycle, cycle - 1))
+                    "reg_{}_bitmap_s".format(level.name()), cycle, cycle - 1))
 
             if self.level_id > 1:
                 for offset in range(1, 5):
@@ -1196,14 +1226,20 @@ class BBQLevelLX(BBQLevel):
                 cg.emit()
 
             cg.start_ifdef("DEBUG")
+            id_str_prefix = ("logical ID: %0d, "
+                             if self.bbq.is_logically_partitioned else "")
+
+            id_val_prefix = ("reg_bbq_id_s[{}], ".format(cycle - 1)
+                             if self.bbq.is_logically_partitioned else "")
+
             cg.start_conditional("if", "reg_valid_s[{}]".format(cycle - 1))
             cg.emit("$display(")
             cg.emit([
-                ("\"[BBQ] At S{} (op: %s) for (L{} addr = %0d)\","
-                .format(cycle, self.level_id)),
+                ("\"[BBQ] At S{} ({}op: %s) for (L{} addr = %0d)\","
+                 .format(cycle, id_str_prefix, self.level_id)),
 
-                ("reg_op_type_s[{0}].name, reg_{1}_addr_s[{0}]);"
-                 .format(cycle - 1, self.name())),
+                ("{0}reg_op_type_s[{1}].name, reg_{2}_addr_s[{1}]);"
+                 .format(id_val_prefix, cycle - 1, self.name())),
             ], True, 4)
 
             cg.end_conditional("if")
