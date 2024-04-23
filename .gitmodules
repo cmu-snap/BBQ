@@ -1,0 +1,3 @@
+[submodule "evaluation/asap7sc7p5t_28"]
+	path = evaluation/asic/asap7sc7p5t_28
+	url = https://github.com/The-OpenROAD-Project/asap7sc7p5t_28.git
