@@ -1,0 +1,37 @@
+#!/usr/bin/env bash
+
+SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" >/dev/null 2>&1 && pwd )"
+PROJECT_DIR="${SCRIPT_DIR}/../.."
+
+CONTAINER_SRC_PATH="/src"
+CONTAINER_SYNOPSYS_PATH="/synopsys"
+CONTAINER_WORK_PATH="/work"
+
+DC_SHELL_PATH="${CONTAINER_SYNOPSYS_PATH}/syn/S-2021.06-SP5/bin/dc_shell"
+
+SYNOPSYS_PATH_DEFAULT="${HOME}/synopsys"
+
+if [[ -z "${SYNOPSYS_PATH}" ]]; then
+  echo "SYNOPSYS_PATH is undefined, using default value: $SYNOPSYS_PATH_DEFAULT"
+  SYNOPSYS_PATH="${SYNOPSYS_PATH_DEFAULT}"
+fi
+
+# docker build -t synopsys $SCRIPT_DIR
+
+docker run -it --rm \
+    -w ${CONTAINER_WORK_PATH} \
+    --mount type=bind,src="${SYNOPSYS_PATH}",target=${CONTAINER_SYNOPSYS_PATH} \
+    --mount type=bind,src="${PROJECT_DIR}",target=${CONTAINER_SRC_PATH} \
+    --mount type=bind,src="${PWD}",target=${CONTAINER_WORK_PATH} \
+    --env PRIORITY_BITS=$PRIORITY_BITS \
+    --env ELEMENT_BITS=$ELEMENT_BITS \
+    --env BITMAP_WIDTH=$BITMAP_WIDTH \
+    --env NUM_LEVELS=$NUM_LEVELS \
+    --env CLOCK_PERIOD=$CLOCK_PERIOD \
+    --env LM_LICENSE_FILE="${CONTAINER_SYNOPSYS_PATH}/license.dat" \
+    --env STROOT="${CONTAINER_SYNOPSYS_PATH}/syn/S-2021.06-SP5" \
+    --env SAED14="${CONTAINER_SYNOPSYS_PATH}/SAED14nm_PDK_12142021/stdcell_rvt/db_nldm" \
+    --env SAED14_SRAM="${CONTAINER_SYNOPSYS_PATH}/SAED14nm_PDK_12142021/SAED14nm_EDK_SRAM_v_05072020/lib/sram/logic_synth" \
+    synopsys ${DC_SHELL_PATH} $@
+
+# read -p "Press press enter to continue"
